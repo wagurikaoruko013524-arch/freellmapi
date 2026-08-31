@@ -4,7 +4,9 @@ import {
   detectPlatform,
   looksLikeApiKey,
   parseAuthJson,
+  parseCsv,
   parseDotEnv,
+  parseExportJson,
   parseJson,
   parseKeysFromFile,
   stripJsoncComments,
@@ -16,6 +18,19 @@ describe('key parser', () => {
     expect(parseDotEnv('GOOGLE_API_KEY="ai-test"\nGROQ_API_KEY=gsk-test # comment')).toEqual([
       { key: 'GOOGLE_API_KEY', value: 'ai-test' },
       { key: 'GROQ_API_KEY', value: 'gsk-test' },
+    ]);
+  });
+
+  it('unquotes dotenv values that carry an inline comment', () => {
+    expect(parseDotEnv('GOOGLE_API_KEY="ai-test" # primary\nGROQ_API_KEY=\'gsk-test\'  # backup')).toEqual([
+      { key: 'GOOGLE_API_KEY', value: 'ai-test' },
+      { key: 'GROQ_API_KEY', value: 'gsk-test' },
+    ]);
+  });
+
+  it('keeps a # that is inside the quotes', () => {
+    expect(parseDotEnv('NVIDIA_API_KEY="nv # test"')).toEqual([
+      { key: 'NVIDIA_API_KEY', value: 'nv # test' },
     ]);
   });
 
@@ -35,11 +50,36 @@ describe('key parser', () => {
   it('detects current provider prefixes', () => {
     expect(detectPlatform('GOOGLE_')).toBe('google');
     expect(detectPlatform('OLLAMA_CLOUD_')).toBe('ollama');
+    expect(detectPlatform('NARAROUTER_')).toBe('nara');
+    expect(detectPlatform('AIONLABS_')).toBe('aion');
+    expect(detectPlatform('REQUESTY_')).toBe('requesty');
+    expect(detectPlatform('NAVYAI_')).toBe('navy');
+    expect(detectPlatform('SEALION_')).toBe('sealion');
+    expect(detectPlatform('ORCAROUTER_')).toBe('orcarouter');
+    expect(detectPlatform('ORCA_')).toBe('orcarouter');
+    expect(detectPlatform('UNOROUTER_')).toBe('unorouter');
+    expect(detectPlatform('UNO_ROUTER_')).toBe('unorouter');
+    expect(detectPlatform('XKIRO_')).toBe('xkiro');
+    expect(detectPlatform('MODELSCOPE_')).toBe('modelscope');
+    expect(detectPlatform('ANYAPI_')).toBe('anyapi');
+    expect(detectPlatform('ANY_API_')).toBe('anyapi');
+    expect(detectPlatform('BAI_')).toBe('bai');
+    expect(detectPlatform('B_AI_')).toBe('bai');
     expect(detectPlatform('SAMBANOVA_')).toBeNull();
   });
 
   it('parses Hermes/OpenCode auth.json provider names', () => {
     expect(AUTH_JSON_PROVIDER_MAP['ollama-cloud']).toBe('ollama');
+    expect(AUTH_JSON_PROVIDER_MAP['bynara']).toBe('nara');
+    expect(AUTH_JSON_PROVIDER_MAP['aion-labs']).toBe('aion');
+    expect(AUTH_JSON_PROVIDER_MAP['requesty']).toBe('requesty');
+    expect(AUTH_JSON_PROVIDER_MAP['api-navy']).toBe('navy');
+    expect(AUTH_JSON_PROVIDER_MAP['sea-lion']).toBe('sealion');
+    expect(AUTH_JSON_PROVIDER_MAP['orca-router']).toBe('orcarouter');
+    expect(AUTH_JSON_PROVIDER_MAP['uno-router']).toBe('unorouter');
+    expect(AUTH_JSON_PROVIDER_MAP['model-scope']).toBe('modelscope');
+    expect(AUTH_JSON_PROVIDER_MAP['any-api']).toBe('anyapi');
+    expect(AUTH_JSON_PROVIDER_MAP['b-ai']).toBe('bai');
     const result = parseAuthJson(JSON.stringify({
       credential_pool: {
         gemini: [{ id: '1', label: 'Gemini', auth_type: 'api_key', access_token: 'AIza-test' }],
@@ -64,5 +104,75 @@ describe('key parser', () => {
     expect(looksLikeApiKey('true')).toBe(false);
     expect(looksLikeApiKey('https://example.com')).toBe(false);
     expect(looksLikeApiKey('sk-valid-token')).toBe(true);
+  });
+
+  it('parses FreeLLMAPI export JSON format', () => {
+    const exportJson = JSON.stringify({
+      version: 1,
+      exportedAt: '2026-07-06T12:00:00Z',
+      source: 'freellmapi',
+      keys: [
+        { platform: 'google', key: 'AIza-test-key', label: 'Google Key' },
+        { platform: 'groq', key: 'gsk-test-key', label: 'Groq Key' },
+      ],
+    });
+    const result = parseExportJson(exportJson);
+    expect(result).not.toBeNull();
+    expect(result!.keys).toHaveLength(2);
+    expect(result!.keys[0]).toEqual({ rawKey: 'Google Key=AIza-test-key', prefix: 'GOOGLE_', platform: 'google' });
+    expect(result!.keys[1]).toEqual({ rawKey: 'Groq Key=gsk-test-key', prefix: 'GROQ_', platform: 'groq' });
+    expect(result!.skipped).toHaveLength(0);
+  });
+
+  it('returns null for non-export JSON', () => {
+    expect(parseExportJson('{"foo":"bar"}')).toBeNull();
+    expect(parseExportJson('[1,2,3]')).toBeNull();
+    expect(parseExportJson('not json')).toBeNull();
+  });
+
+  // The platform now rides along explicitly instead of being re-derived from
+  // the generated prefix: 'custom' has no PREFIX_MAP entry, so inference alone
+  // silently dropped every custom endpoint on import (#687).
+  it('parses CSV format with header', () => {
+    const csv = 'platform,key,label\n"google","AIza-test","Google Key"\n"groq","gsk-test","Groq Key"\n';
+    expect(parseCsv(csv)).toEqual([
+      { key: 'GOOGLE_KEY', value: 'AIza-test', platform: 'google' },
+      { key: 'GROQ_KEY', value: 'gsk-test', platform: 'groq' },
+    ]);
+  });
+
+  it('parses CSV format without header', () => {
+    const csv = 'google,AIza-test,Google Key\n';
+    expect(parseCsv(csv)).toEqual([
+      { key: 'GOOGLE_KEY', value: 'AIza-test', platform: 'google' },
+    ]);
+  });
+
+  it('parses the base_url column that makes a custom row importable', () => {
+    const csv = 'platform,key,label,base_url\n"custom","sk-local","LM Studio","http://192.168.1.5:1234/v1"\n';
+    expect(parseCsv(csv)).toEqual([
+      { key: 'CUSTOM_KEY', value: 'sk-local', platform: 'custom', baseUrl: 'http://192.168.1.5:1234/v1' },
+    ]);
+  });
+
+  it('handles export JSON via parseKeysFromFile', () => {
+    const exportJson = JSON.stringify({
+      version: 1,
+      exportedAt: '2026-07-06T12:00:00Z',
+      source: 'freellmapi',
+      keys: [
+        { platform: 'mistral', key: 'mist-test', label: 'Mistral Key' },
+      ],
+    });
+    const result = parseKeysFromFile(exportJson, 'freellmapi-keys.json');
+    expect(result.keys).toHaveLength(1);
+    expect(result.keys[0]).toEqual({ rawKey: 'Mistral Key=mist-test', prefix: 'MISTRAL_', platform: 'mistral' });
+  });
+
+  it('handles CSV via parseKeysFromFile', () => {
+    const csv = 'platform,key,label\n"nvidia","nv-test","Nvidia Key"\n';
+    const result = parseKeysFromFile(csv, 'freellmapi-keys.csv');
+    expect(result.keys).toHaveLength(1);
+    expect(result.keys[0]).toEqual({ rawKey: 'NVIDIA_KEY=nv-test', prefix: 'NVIDIA_', platform: 'nvidia' });
   });
 });

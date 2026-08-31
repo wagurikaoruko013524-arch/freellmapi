@@ -6,10 +6,15 @@ import { hasProvider } from '../providers/index.js';
 import { deleteUnusedCustomEndpointKey } from '../lib/custom-provider-cleanup.js';
 import {
   isCatalogManagedModel,
+  overriddenFieldNames,
   recordCatalogModelTombstone,
   upsertModelOverrides,
   type ModelOverridePatch,
 } from '../services/model-state.js';
+import { pruneUnavailableSavedFusionConfig } from '../services/fusion.js';
+import { getActiveProfileId } from '../services/profile-models.js';
+import { endpointScopeOfKey, qualifiedModelMemberId } from '../lib/endpoint-scope.js';
+import { recordCustomModelTombstone } from '../services/custom-model-tombstone.js';
 
 export const modelsRouter = Router();
 
@@ -17,7 +22,10 @@ const modelUpdateSchema = z.object({
   displayName: z.string().min(1).max(200).optional(),
   intelligenceRank: z.number().int().min(1).max(1000).optional(),
   speedRank: z.number().int().min(1).max(1000).optional(),
-  sizeLabel: z.string().min(1).max(40).optional(),
+  // '' is a legal value: size_label is TEXT NOT NULL DEFAULT '' and the empty
+  // string is the canonical "unscored" tier (scores 0 on the intelligence
+  // axis), so the dashboard's "None" option must be able to send it.
+  sizeLabel: z.string().max(40).optional(),
   rpmLimit: z.number().int().positive().nullable().optional(),
   rpdLimit: z.number().int().positive().nullable().optional(),
   tpmLimit: z.number().int().positive().nullable().optional(),
@@ -51,6 +59,7 @@ type ModelRow = {
   platform: string;
   model_id: string;
   key_id: number | null;
+  source: string;
 };
 
 function dbValue(key: keyof typeof MODEL_FIELD_COLUMNS, value: unknown): unknown {
@@ -60,7 +69,7 @@ function dbValue(key: keyof typeof MODEL_FIELD_COLUMNS, value: unknown): unknown
 
 function fetchModelRow(id: number): ModelRow | undefined {
   return getDb()
-    .prepare('SELECT id, platform, model_id, key_id FROM models WHERE id = ?')
+    .prepare('SELECT id, platform, model_id, key_id, source FROM models WHERE id = ?')
     .get(id) as ModelRow | undefined;
 }
 
@@ -72,13 +81,16 @@ modelsRouter.delete('/custom/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const row = db.prepare("SELECT id, key_id FROM models WHERE id = ? AND platform = 'custom'").get(id) as { id: number; key_id: number | null } | undefined;
+  const row = db.prepare("SELECT id, key_id, model_id FROM models WHERE id = ? AND platform = 'custom'").get(id) as { id: number; key_id: number | null; model_id: string } | undefined;
   if (!row) {
     res.status(404).json({ error: { message: `Unknown custom model ${id}` } });
     return;
   }
 
   const remove = db.transaction(() => {
+    // #926: keep this deletion across the scheduled custom-model sync, or the
+    // next daily pass re-registers a model the operator removed on purpose.
+    recordCustomModelTombstone(db, endpointScopeOfKey(db, row.key_id), row.model_id);
     db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?').run(id);
     db.prepare("DELETE FROM models WHERE id = ? AND platform = 'custom'").run(id);
     deleteUnusedCustomEndpointKey(db, row.key_id);
@@ -116,6 +128,8 @@ modelsRouter.patch('/:id', (req: Request, res: Response) => {
   }
 
   const applyUpdate = db.transaction(() => {
+    const disablesModel = modelPatch.enabled === false;
+
     if (modelKeys.length > 0) {
       const assignments: string[] = [];
       const values: unknown[] = [];
@@ -139,11 +153,22 @@ modelsRouter.patch('/:id', (req: Request, res: Response) => {
         }
         upsertModelOverrides(db, row.platform, row.model_id, overridePatch);
       }
+
+      if (disablesModel) {
+        db.prepare('UPDATE profile_models SET enabled = 0 WHERE model_db_id = ?').run(id);
+        pruneUnavailableSavedFusionConfig();
+      }
     }
 
-    if (parsed.data.fallbackEnabled !== undefined) {
+    if (disablesModel || parsed.data.fallbackEnabled !== undefined) {
+      const next = disablesModel ? 0 : parsed.data.fallbackEnabled ? 1 : 0;
       db.prepare('UPDATE fallback_config SET enabled = ? WHERE model_db_id = ?')
-        .run(parsed.data.fallbackEnabled ? 1 : 0, id);
+        .run(next, id);
+      const activeProfileId = getActiveProfileId(db);
+      if (activeProfileId != null) {
+        db.prepare('UPDATE profile_models SET enabled = ? WHERE profile_id = ? AND model_db_id = ?')
+          .run(next, activeProfileId, id);
+      }
     }
   });
   applyUpdate();
@@ -168,6 +193,10 @@ modelsRouter.delete('/:id', (req: Request, res: Response) => {
   const remove = db.transaction(() => {
     if (isCatalogManagedModel(row)) {
       recordCatalogModelTombstone(db, 'chat', row.platform, row.model_id);
+    } else if (row.platform === 'custom') {
+      // #926: same "keep it deleted" contract for custom relay models — the
+      // scheduled custom-model sync must not resurrect this row.
+      recordCustomModelTombstone(db, endpointScopeOfKey(db, row.key_id), row.model_id);
     }
     db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?').run(id);
     db.prepare('DELETE FROM models WHERE id = ?').run(id);
@@ -181,16 +210,28 @@ modelsRouter.delete('/:id', (req: Request, res: Response) => {
 // List all models with availability info
 modelsRouter.get('/', (_req: Request, res: Response) => {
   const db = getDb();
-  const models = db.prepare(`
+  const activeProfileId = getActiveProfileId(db);
+  const models = activeProfileId == null ? db.prepare(`
     SELECT m.*, fc.priority, fc.enabled as fallback_enabled,
-           mo.overrides_json IS NOT NULL AS has_overrides,
+           mo.overrides_json IS NOT NULL AS has_overrides, mo.overrides_json,
            ak.label AS key_label
     FROM models m
     LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
     LEFT JOIN model_overrides mo ON mo.platform = m.platform AND mo.model_id = m.model_id
     LEFT JOIN api_keys ak ON ak.id = m.key_id
     ORDER BY COALESCE(fc.priority, m.intelligence_rank) ASC
-  `).all() as any[];
+  `).all() as any[] : db.prepare(`
+    SELECT m.*, COALESCE(pm.priority, fc.priority) AS priority,
+           COALESCE(pm.enabled, fc.enabled) AS fallback_enabled,
+           mo.overrides_json IS NOT NULL AS has_overrides, mo.overrides_json,
+           ak.label AS key_label
+    FROM models m
+    LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+    LEFT JOIN profile_models pm ON pm.profile_id = ? AND pm.model_db_id = m.id
+    LEFT JOIN model_overrides mo ON mo.platform = m.platform AND mo.model_id = m.model_id
+    LEFT JOIN api_keys ak ON ak.id = m.key_id
+    ORDER BY COALESCE(pm.priority, fc.priority, m.intelligence_rank) ASC
+  `).all(activeProfileId) as any[];
 
   // Count keys per platform
   const keyCounts = db.prepare(`
@@ -221,10 +262,19 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
     supportsTools: m.supports_tools === 1,
     priority: m.priority,
     fallbackEnabled: m.fallback_enabled === 1,
-    source: m.platform === 'custom' || m.key_id != null ? 'custom' : 'catalog',
+    // Real provenance from models.source ('catalog' | 'user'). The dashboard's
+    // existing vocabulary for user-added rows is 'custom', so map 1:1 here —
+    // this now also flags user models on native platforms (declarative
+    // config / admin adds), which the old platform/key_id heuristic missed.
+    source: m.source === 'user' ? 'custom' : 'catalog',
     keyId: m.key_id ?? null,
     keyLabel: m.key_label ?? null,
+    // Endpoint identity for custom rows (#651); null for catalog models and for
+    // custom rows that carry no endpoint scope.
+    endpointScope: m.endpoint_scope || null,
+    qualifiedModelId: qualifiedModelMemberId(m.platform, m.model_id, m.endpoint_scope),
     hasOverrides: Boolean(m.has_overrides),
+    overrideFields: overriddenFieldNames(m.overrides_json),
     hasProvider: hasProvider(m.platform),
     keyCount: keyCountMap.get(m.platform) ?? 0,
   }));

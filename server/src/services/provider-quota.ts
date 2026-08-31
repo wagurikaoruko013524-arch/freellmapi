@@ -1,6 +1,8 @@
 import crypto from 'crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { getDb } from '../db/index.js';
+// Single shared Retry-After parser (was duplicated here and in providers/base.ts).
+import { parseRetryAfterMs } from '../providers/base.js';
 import type {
   Platform,
   QuotaMetric,
@@ -102,16 +104,6 @@ function parseResetAtFromHeader(raw: string | null, now = Date.now()): string | 
   return new Date(now + parsed * 1000).toISOString();
 }
 
-function parseRetryAfterMs(raw: string | null): number | null {
-  if (!raw) return null;
-  const seconds = Number(raw.trim());
-  if (Number.isFinite(seconds)) return Math.max(0, Math.round(seconds * 1000));
-  const asDate = new Date(raw);
-  const ms = asDate.getTime();
-  if (Number.isNaN(ms)) return null;
-  return Math.max(0, ms - Date.now());
-}
-
 function pickBetterSource(existing: QuotaObservationSource | null | undefined, next: QuotaObservationSource): QuotaObservationSource {
   if (!existing) return next;
   return SOURCE_PRIORITY[next] >= SOURCE_PRIORITY[existing] ? next : existing;
@@ -123,6 +115,7 @@ function inferPoolForPlatform(platform: Platform, modelId?: string | null): stri
   if (platform === 'google') return 'google::project';
   if (platform === 'groq') return 'groq::account';
   if (platform === 'cerebras') return 'cerebras::shared';
+  if (platform === 'bai') return 'bai::promo';
   if (platform === 'sambanova') return 'sambanova::shared';
   if (platform === 'nvidia') return 'nvidia::credit-pool';
   if (platform === 'mistral') return 'mistral::experiment-pool';
@@ -132,7 +125,7 @@ function inferPoolForPlatform(platform: Platform, modelId?: string | null): stri
   if (platform === 'zhipu') return 'zhipu::account';
   if (platform === 'ollama') return 'ollama::cloud';
   if (platform === 'kilo') return 'kilo::anonymous';
-  if (platform === 'pollinations') return 'pollinations::anonymous';
+  if (platform === 'pollinations') return 'pollinations::account';
   if (platform === 'llm7') return 'llm7::anonymous';
   // AI Horde: anonymous requests share one queue priority (the 0000000000 key),
   // so they pool together; a registered key has its own kudos priority but we
@@ -144,11 +137,32 @@ function inferPoolForPlatform(platform: Platform, modelId?: string | null): stri
   if (platform === 'routeway') return 'routeway::free';
   if (platform === 'bazaarlink') return 'bazaarlink::free';
   if (platform === 'ainative') return 'ainative::account';
+  if (platform === 'aion') return 'aion::free';
+  if (platform === 'requesty') return 'requesty::free';
+  if (platform === 'navy') return 'navy::free';
+  if (platform === 'nara') return 'nara::free';
+  if (platform === 'sealion') return 'sealion::free';
+  // OrcaRouter: one rate-limited free allowance across all `*-free` aliases
+  // and the `orcarouter/free` auto route (limits unpublished; 429 on cap).
+  if (platform === 'orcarouter') return 'orcarouter::free';
+  // UnoRouter: the docs say 1 req/min per free model, but live-probed
+  // 2026-08-23 a burst across many `:free` models put the whole account into
+  // 429 on every model for several minutes — so one pool, and a 429 on any
+  // model backs off the platform as a whole.
+  if (platform === 'unorouter') return 'unorouter::free';
+  // xkiro: one account-level allowance shared across its free models (the
+  // free tier is a per-account grant, not per-model), so one pool.
+  if (platform === 'xkiro') return 'xkiro::free';
+  // AnyAPI: the free tier is one 100K-tokens/day budget for the whole account,
+  // shared across every free/basic model — so one pool, not one per model.
+  if (platform === 'anyapi') return 'anyapi::free';
+  // ModelScope: one 2000-requests/day quota across the whole account.
+  if (platform === 'modelscope') return 'modelscope::account';
   return normalizedModelId ? `${platform}::${normalizedModelId}` : `${platform}::account`;
 }
 
 function isSharedPool(platform: Platform): boolean {
-  return ['openrouter', 'google', 'groq', 'cerebras', 'sambanova', 'nvidia', 'mistral', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama', 'kilo', 'pollinations', 'llm7', 'huggingface', 'opencode', 'routeway', 'bazaarlink', 'ainative', 'aihorde'].includes(platform);
+  return ['openrouter', 'google', 'groq', 'cerebras', 'bai', 'sambanova', 'nvidia', 'mistral', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama', 'kilo', 'pollinations', 'llm7', 'huggingface', 'opencode', 'routeway', 'bazaarlink', 'ainative', 'aion', 'requesty', 'navy', 'nara', 'sealion', 'orcarouter', 'unorouter', 'xkiro', 'anyapi', 'modelscope', 'aihorde'].includes(platform);
 }
 
 type HeaderSpec = { metric: QuotaMetric; limit: string; remaining?: string; reset?: string; strategy?: QuotaResetStrategy };
@@ -165,6 +179,17 @@ const HEADER_SPECS: Partial<Record<Platform, HeaderSpec[]>> = {
   openrouter: [
     { metric: 'requests', limit: 'x-ratelimit-limit-requests', remaining: 'x-ratelimit-remaining-requests', reset: 'x-ratelimit-reset-requests', strategy: 'provider_reported' },
     { metric: 'tokens', limit: 'x-ratelimit-limit-tokens', remaining: 'x-ratelimit-remaining-tokens', reset: 'x-ratelimit-reset-tokens', strategy: 'provider_reported' },
+  ],
+  // ModelScope reportedly returns `modelscope-ratelimit-*`-style headers on
+  // authenticated responses. UNCONFIRMED: no real token exists for this
+  // platform yet (auth needs an Alibaba Cloud cn-site binding, #581), and the
+  // keyless probes we could run (401s, unauthenticated /v1/models) carry no
+  // ratelimit headers at all. Absent headers are a no-op in
+  // maybeAddObservation, so a wrong guess here costs nothing; community
+  // testers should dump response headers (see the #581 tester guide) and
+  // correct these names.
+  modelscope: [
+    { metric: 'requests', limit: 'modelscope-ratelimit-requests-limit', remaining: 'modelscope-ratelimit-requests-remaining', reset: 'modelscope-ratelimit-requests-reset', strategy: 'provider_reported' },
   ],
 };
 
@@ -228,7 +253,7 @@ export function parseQuotaObservationsFromResponse(
     }
   }
 
-  const retryAfterMs = parseRetryAfterMs(get('retry-after'));
+  const retryAfterMs = parseRetryAfterMs(get('retry-after')) ?? null;
   if (retryAfterMs !== null) {
     observations.push({
       ...base,
@@ -365,6 +390,10 @@ export function recordQuotaObservation(input: QuotaObservationInput): ProviderQu
     );
   })();
 
+  // The row just moved, so the memoised headroom for this platform is wrong —
+  // drop it rather than let a 5s window hide a fresh 429 from the router.
+  invalidateKeyQuotaHeadroom(platform);
+
   return {
     id,
     platform,
@@ -399,6 +428,102 @@ export function recordQuotaObservationsFromResponse(
     .filter((row): row is ProviderQuotaObservation => row !== null);
 }
 
+// A quota window whose reset_at has passed has replenished at the provider, but
+// remaining_value is only ever written on a fresh observation — so a key that hit
+// remaining=0 reads as "exhausted" forever on the dashboard health view until the
+// next live call (#453). Restore remaining to the known limit (or clear it to
+// unknown when the limit isn't known — `= limit_value` yields NULL in that case)
+// and drop the stale reset_at so the row stops reading as exhausted and this
+// fix-up doesn't recur. Runs on read; a new observation re-populates reset_at.
+function normalizeExpiredQuotaState(db: ReturnType<typeof getDb>): void {
+  db.prepare(`
+    UPDATE provider_quota_state
+       SET remaining_value = limit_value,
+           reset_at = NULL,
+           updated_at = datetime('now')
+     WHERE reset_at IS NOT NULL
+       AND julianday(reset_at) < julianday('now')
+  `).run();
+}
+
+// ── Per-key headroom (routing signal) ───────────────────────────────────────
+// getQuotaStateForKeys is a panel query: it takes a write (the expiry fix-up)
+// and window-functions the whole observation log. The router needs a far
+// smaller answer — "how much of its budget does each key of ONE platform have
+// left" — on a path that runs per chain entry per request, so it gets its own
+// read-only, platform-filtered query behind a short TTL.
+
+/** Confidence floor for letting an observation steer routing. Keeps headers,
+ *  quota APIs and 429 bodies in; leaves local estimates and probes out. */
+const HEADROOM_MIN_CONFIDENCE = 0.7;
+/** Quota moves on the timescale of a rate-limit window, not a request, so a
+ *  few seconds of staleness is invisible while the query count drops to ~one
+ *  per platform per burst. Writes bust the entry outright (see below). */
+const HEADROOM_TTL_MS = 5_000;
+
+// The Db handle is part of the cache identity: reconnecting (tests, a restore)
+// hands back a different object, which invalidates every entry at once.
+const headroomCache = new Map<string, { db: unknown; at: number; map: Map<number, number> }>();
+
+/**
+ * Fraction of the observed budget still available for each key of `platform`,
+ * as keyId → 0..1, where 1 is untouched and 0 exhausted. Keys with no usable
+ * observation are simply absent — that is not the same as "empty", and callers
+ * must treat a miss as unknown rather than as zero headroom.
+ *
+ * A key metered on several metrics takes the WORST of them: the binding
+ * constraint is what 429s, so a key with 90% of its requests but 2% of its
+ * tokens left has 2% of headroom, not 90%.
+ */
+export function getKeyQuotaHeadroom(platform: Platform): Map<number, number> {
+  let db;
+  try {
+    db = getDb();
+  } catch {
+    return new Map();
+  }
+  const now = Date.now();
+  const cached = headroomCache.get(platform);
+  if (cached && cached.db === db && now - cached.at < HEADROOM_TTL_MS) return cached.map;
+
+  const rows = db.prepare(`
+    SELECT key_id AS keyId,
+           limit_value AS limitValue,
+           remaining_value AS remainingValue,
+           CASE WHEN reset_at IS NOT NULL AND julianday(reset_at) < julianday('now')
+                THEN 1 ELSE 0 END AS expired
+      FROM provider_quota_state
+     WHERE platform = ?
+       AND confidence >= ?
+       AND limit_value IS NOT NULL
+       AND limit_value > 0
+       AND remaining_value IS NOT NULL
+  `).all(platform, HEADROOM_MIN_CONFIDENCE) as {
+    keyId: number; limitValue: number; remainingValue: number; expired: number;
+  }[];
+
+  const map = new Map<number, number>();
+  for (const row of rows) {
+    // A window that already reset is a full budget again. Same rule as
+    // normalizeExpiredQuotaState, minus the write — this path must not take
+    // one just to answer a routing question.
+    const ratio = row.expired
+      ? 1
+      : Math.max(0, Math.min(1, row.remainingValue / row.limitValue));
+    const prev = map.get(row.keyId);
+    if (prev === undefined || ratio < prev) map.set(row.keyId, ratio);
+  }
+  headroomCache.set(platform, { db, at: now, map });
+  return map;
+}
+
+/** Drop the memoised headroom for one platform (or all of them). Called on
+ *  every write so a fresh observation is visible to the very next route. */
+export function invalidateKeyQuotaHeadroom(platform?: Platform): void {
+  if (platform) headroomCache.delete(platform);
+  else headroomCache.clear();
+}
+
 export function getQuotaStateForKeys(): QuotaObservationView[] {
   let db;
   try {
@@ -406,6 +531,7 @@ export function getQuotaStateForKeys(): QuotaObservationView[] {
   } catch {
     return [];
   }
+  normalizeExpiredQuotaState(db);
   return db.prepare(`
     WITH latest AS (
       SELECT
@@ -419,6 +545,9 @@ export function getQuotaStateForKeys(): QuotaObservationView[] {
     SELECT
       pqs.platform,
       pqs.key_id AS keyId,
+      -- The panel identifies a row by its key. A bare "key #7" says nothing, so
+      -- carry the operator's own name for it (#705).
+      k.label AS keyLabel,
       pqs.quota_pool_key AS quotaPoolKey,
       pqs.metric,
       pqs.limit_value AS "limit",
@@ -438,6 +567,7 @@ export function getQuotaStateForKeys(): QuotaObservationView[] {
       latest.raw_json AS rawJson,
       latest.created_at AS createdAt
     FROM provider_quota_state pqs
+    LEFT JOIN api_keys k ON k.id = pqs.key_id
     LEFT JOIN latest
       ON latest.platform = pqs.platform
      AND latest.key_id = pqs.key_id
